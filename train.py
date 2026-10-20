@@ -6,8 +6,8 @@ if __name__ == '__main__':
     results = model.train(
         data='./drone_detection/data.yaml', # Шлях до датасету
         epochs=50,
-        imgsz=640,                          # Для малих дронів можна підняти до 800 або 1024
-        batch=8,
+        imgsz=960,                          # Для малих дронів можна підняти до 800 або 1024
+        batch=4,
         workers=2,
         device=0,
         amp=True,
