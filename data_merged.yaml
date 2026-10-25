@@ -1,0 +1,13 @@
+names:
+- drone
+- airplane
+- bird
+- helicopter
+nc: 4
+test: dataset_v/images/test
+train:
+- drone_detection/train/images
+- dataset_v/images/train
+val:
+- drone_detection/valid/images
+- dataset_v/images/val

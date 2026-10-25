@@ -2,3 +2,7 @@
 venv
 drone_detection
 drone_detection_orig
+train.py
+Drone-detection-dataset-1.0.0
+convert_dataset.py
+dataset_v

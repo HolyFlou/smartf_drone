@@ -1,330 +1,193 @@
+import time
+
 import cv2
 import numpy as np
-import time
 from ultralytics import YOLO
 
-# ==========================================
-# 1. НАЛАШТУВАННЯ ТА ІНІЦІАЛІЗАЦІЯ
-# ==========================================
+# ---------- НАСТРОЙКИ ----------
+MODEL_PATH = 'runs/detect/fpv_drone_yolo26_2.1/weights/best.pt'
+VIDEO_IN, VIDEO_OUT = "./V_DRONE_016.mp4", "./output_detection.mp4"
 
-# Завантажуємо навчену модель YOLO для виявлення дронів
-model = YOLO('runs/detect/fpv_drone_yolo26_2/weights/best.pt')
+CONF_FULL, CONF_TILE, CONF_VERIFY = 0.40, 0.30, 0.25  # пороги дрона: весь кадр / тайлы / проверка при сопровождении
+TILE = 0.6             # размер тайла в долях кадра (2x2 тайла с перекрытием)
+SMALL_PX = 24          # цель меньше этого размера считается «малой»
+CONF_OTHER = 0.30      # порог для самолёта/птицы (красная рамка)
+VETO_MARGIN = 0.10     # дрон отбрасывается, если на нём рамка самолёта с уверенностью >= (дрон - 0.10)
+VERIFY_EVERY = 4       # проверка YOLO каждые N кадров
+MAX_MISSES = 5         # сколько проверок подряд без подтверждения до сброса
+IOU_MIN = 0.10         # минимальное пересечение рамки трекера и рамки YOLO
+RELATCH_DIST = 4       # переприцел на «чужую» рамку, только если она ближе чем 4 размера дрона
+F = cv2.FONT_HERSHEY_SIMPLEX
 
-# Шляхи до вхідного відео та файлу збереження результату
-video_path = "./V_DRONE_016.mp4"
-output_path = "./output_detection.mp4"
+model = YOLO(MODEL_PATH)
+cap = cv2.VideoCapture(VIDEO_IN)
+if not cap.isOpened():
+    raise SystemExit(f"Не удалось открыть видео: {VIDEO_IN}")
+width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+out = cv2.VideoWriter(VIDEO_OUT, cv2.VideoWriter_fourcc(*'mp4v'), cap.get(cv2.CAP_PROP_FPS) or 30.0, (width, height))
 
-# Відкриваємо відеопотік
-cap = cv2.VideoCapture(video_path)
+# Класс дрона. Всё остальное (airplane, bird, ...) считается «не дрон». Если нашёлся не тот — задай вручную: DRONE = 0
+DRONE = next((i for i, n in model.names.items() if any(k in str(n).lower() for k in ("drone", "uav", "дрон"))), None)
+print(f"Классы модели: {model.names} | дрон = {DRONE}")
+if DRONE is None:
+    raise SystemExit("В модели нет класса 'drone'. Задай DRONE вручную.")
 
-# Отримуємо параметри вхідного відео (ширина, висота, кадри/сек)
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+# CSRT, а если его нет — KCF
+make_tracker = next((getattr(m, n) for m in (cv2, getattr(cv2, "legacy", cv2))
+                     for n in ("TrackerCSRT_create", "TrackerKCF_create") if hasattr(m, n)), None)
+if make_tracker is None:
+    raise SystemExit("Нет CSRT/KCF трекера. Установи opencv-contrib-python.")
 
-# Налаштовуємо кодек та об'єкт для запису вихідного відео
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(output_path, fourcc, video_fps, (width, height))
 
-# ==========================================
-# 2. СТАН) МАРШРУТИЗАЦІЇ ТА ГЛОБАЛЬНІ ПАРАМЕТРИ
-# ==========================================
+# ---------- ФУНКЦИИ ----------
+def new_kf(cx, cy):
+    """Фильтр Калмана: состояние [x, y, vx, vy, ax, ay], измерение [x, y]."""
+    k = cv2.KalmanFilter(6, 2)
+    k.transitionMatrix = (np.eye(6) + np.eye(6, k=2) + 0.5 * np.eye(6, k=4)).astype(np.float32)
+    k.measurementMatrix = np.eye(2, 6, dtype=np.float32)
+    k.processNoiseCov = np.eye(6, dtype=np.float32) * 0.03
+    k.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+    k.errorCovPost = np.eye(6, dtype=np.float32)
+    k.statePost = np.float32([[cx], [cy], [0], [0], [0], [0]])
+    return k
 
-# Визначаємо стани скінченного автомата (FSM)
-STATE_SEARCHING = 0  # Стан пошуку (детекція через YOLO)
-STATE_TRACKING = 1   # Стан ведення цілі (оптичний трекер + фільтр Калмана)
-
-state = STATE_SEARCHING
-tracker = None
-kf = None
-
-# Параметри логіки верифікації цілі
-VERIFY_EVERY = 5   # Перевіряти ціль за допомогою YOLO кожні N кадрів
-MAX_MISSES = 5     # Максимальна кількість поспіль пропущених верифікацій до втрати цілі
-IOU_MIN = 0.10     # Мінімальний поріг IoU для підтвердження, що YOLO знайшла ту ж саму ціль
-frame_idx = 0      # Лічильник кадрів
-misses = 0         # Лічильник пропущених верифікацій
-
-# Змінні для розрахунку FPS
-prev_time = time.time()
-fps_display = 0.0
-
-# ==========================================
-# 3. ДОПОМІЖНІ КЛАСИ ТА ФУНКЦІЇ
-# ==========================================
-
-class Kalman6D:
-    """
-    6D Фільтр Калмана з урахуванням координати, швидкості та прискорення (X, Y).
-    Вектор стану: [x, y, vx, vy, ax, ay]^T
-    Вектор вимірювань: [x, y]^T
-    """
-    def __init__(self, init_x, init_y, dt=1.0):
-        self.dt = dt
-        # 6 елементів стану, 2 елементи вимірювання (координати центру x, y)
-        self.kf = cv2.KalmanFilter(6, 2)
-        
-        # Матриця переходу стану (Transition Matrix - F)
-        # Моделює кінематику: x_new = x + vx*dt + 0.5*ax*dt^2
-        self.kf.transitionMatrix = np.array([
-            [1, 0, dt,  0, 0.5 * (dt**2),            0],
-            [0, 1,  0, dt,            0, 0.5 * (dt**2)],
-            [0, 0,  1,  0,           dt,            0],
-            [0, 0,  0,  1,            0,           dt],
-            [0, 0,  0,  0,            1,            0],
-            [0, 0,  0,  0,            0,            1]
-        ], dtype=np.float32)
-        
-        # Матриця вимірювань (Measurement Matrix - H)
-        # Вказує, що ми спостерігаємо лише координати X та Y
-        self.kf.measurementMatrix = np.array([
-            [1, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0]
-        ], dtype=np.float32)
-        
-        # Коваріація шуму процесу (Process Noise Covariance - Q)
-        self.kf.processNoiseCov = np.eye(6, dtype=np.float32) * 0.03
-        
-        # Коваріація шуму вимірювань (Measurement Noise Covariance - R)
-        self.kf.measurementNoiseCov = np.array([
-            [0.5, 0],
-            [0, 0.5]
-        ], dtype=np.float32)
-        
-        # Початкова коваріація помилки (Post-error covariance - P)
-        self.kf.errorCovPost = np.eye(6, dtype=np.float32)
-        
-        # Ініціалізація початкового стану
-        self.kf.statePre = np.array([[init_x], [init_y], [0], [0], [0], [0]], dtype=np.float32)
-        self.kf.statePost = np.array([[init_x], [init_y], [0], [0], [0], [0]], dtype=np.float32)
-
-    def predict(self):
-        """Прогнозує наступну позицію об'єкта на основі кінематики."""
-        predicted = self.kf.predict()
-        return int(predicted[0][0]), int(predicted[1][0])
-
-    def correct(self, meas_x, meas_y):
-        """
-        Оновлює оцінку стану на основі реальних отриманих вимірювань (meas_x, meas_y).
-        Повертає скориговані координати, швидкість та прискорення.
-        """
-        measurement = np.array([[np.float32(meas_x)], [np.float32(meas_y)]])
-        corrected = self.kf.correct(measurement)
-        return (int(corrected[0][0]), int(corrected[1][0])), (corrected[2][0], corrected[3][0]), (corrected[4][0], corrected[5][0])
 
 def iou(a, b):
-    """
-    Обчислює Intersection over Union (IoU) між двома прямокутниками.
-    a, b: кортежі виду (x, y, w, h)
-    """
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    
-    # Координати перетину
-    x1, y1 = max(ax, bx), max(ay, by)
-    x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
-    
-    # Площа перетину
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    
-    # Перетин / Об'єднання
-    return inter / (aw * ah + bw * bh - inter + 1e-9)
+    """Пересечение двух рамок (x, y, w, h, ...)."""
+    w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+    h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+    inter = max(0, w) * max(0, h)
+    return inter / (a[2] * a[3] + b[2] * b[3] - inter + 1e-9)
 
-def create_tracker():
-    """Створює оптичний трекер OpenCV (перевага CSRT, при відсутності — KCF)."""
-    if hasattr(cv2, 'TrackerCSRT_create'):
-        return cv2.TrackerCSRT_create()
-    elif hasattr(cv2, 'legacy'):
-        return cv2.legacy.TrackerCSRT_create()
-    else:
-        return cv2.TrackerKCF_create()
 
-def apply_digital_zoom(frame, cx, cy, zoom_radius=140, target_size=(width, height)):
-    """
-    Вирізає область (кроп) навколо точки (cx, cy) і масштабує її до розміру target_size (цифровий зум).
-    Повертає:
-      - zoomed_frame: масштабоване зображення
-      - кортеж параметрів кропу: (x1, y1, scale_x, scale_y) для зворотного перерахунку координат
-    """
-    H, W = frame.shape[:2]
-    x1, y1 = max(0, cx - zoom_radius), max(0, cy - zoom_radius)
-    x2, y2 = min(W, cx + zoom_radius), min(H, cy + zoom_radius)
-    crop = frame[y1:y2, x1:x2]
-    
-    # Якщо область кропу вийшла порожньою
-    if crop.size == 0:
-        return frame.copy(), (0, 0, 1.0, 1.0)
-    
-    crop_h, crop_w = crop.shape[:2]
-    zoomed_frame = cv2.resize(crop, target_size, interpolation=cv2.INTER_LINEAR)
-    
-    # Зберігаємо коефіцієнти масштабування
-    return zoomed_frame, (x1, y1, crop_w / target_size[0], crop_h / target_size[1])
+def zoom(frame, cx, cy, r):
+    """Вырезает окно высотой 2r вокруг (cx, cy) и растягивает до размера кадра.
+    Возвращает (картинка, (x0, y0, scale_x, scale_y))."""
+    hh, hw = min(r, height // 2), min(round(r * width / height), width // 2)
+    x0 = int(np.clip(cx - hw, 0, width - 2 * hw))
+    y0 = int(np.clip(cy - hh, 0, height - 2 * hh))
+    crop = frame[y0:y0 + 2 * hh, x0:x0 + 2 * hw]
+    return cv2.resize(crop, (width, height)), (x0, y0, 2 * hw / width, 2 * hh / height)
 
-# ==========================================
-# 4. ОСНОВНИЙ ЦИКЛ ОБРОБКИ ВІДЕО
-# ==========================================
 
-while cap.isOpened():
+def detect(img, conf_drone, crop=(0, 0, 1, 1)):
+    """YOLO. Возвращает (drones, others): списки (x, y, w, h, conf) в координатах ПОЛНОГО кадра.
+    others = самолёты/птицы. Дрон отбрасывается, если на нём стоит рамка другого класса
+    с близкой уверенностью (agnostic_nms у YOLO26 не работает, поэтому делаем это вручную)."""
+    global raw_max
+    ox, oy, sx, sy = crop
+    b = model(img, conf=0.05, verbose=False)[0].boxes  # низкий порог — чтобы видеть самолёты и для диагностики
+    rows = [(int(x1 * sx + ox), int(y1 * sy + oy), int((x2 - x1) * sx), int((y2 - y1) * sy), c, k)
+            for (x1, y1, x2, y2), c, k in zip(b.xyxy.cpu().numpy(), b.conf.tolist(), b.cls.tolist())]
+    others = [r for r in rows if r[5] != DRONE]
+    raw_max = max([raw_max] + [r[4] for r in rows if r[5] == DRONE])  # лучшая уверенность дрона, даже ниже порога
+    drones = [r[:5] for r in rows
+              if r[5] == DRONE and r[4] >= conf_drone and r[3] > 0 and 0.3 <= r[2] / r[3] <= 3.2
+              and not any(iou(r, o) > 0.3 and o[4] >= r[4] - VETO_MARGIN for o in others)]
+    return sorted(drones, key=lambda d: -d[4]), [o[:5] for o in others if o[4] >= CONF_OTHER]
+
+
+def search_views(frame):
+    """Весь кадр + 4 перекрывающихся тайла, каждый растянут до размера кадра (малая цель становится крупнее)."""
+    yield frame, (0, 0, 1, 1), CONF_FULL
+    tw, th = int(width * TILE), int(height * TILE)
+    for y0 in (0, height - th):
+        for x0 in (0, width - tw):
+            yield cv2.resize(frame[y0:y0 + th, x0:x0 + tw], (width, height)), (x0, y0, tw / width, th / height), CONF_TILE
+
+
+def init_tracker(frame, x, y, w, h):
+    """Обрезает рамку по кадру и создаёт новый трекер. Возвращает рамку (x, y, w, h) или None."""
+    global tracker
+    x1, y1, x2, y2 = max(0, x), max(0, y), min(width, x + w), min(height, y + h)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    tracker = make_tracker()
+    tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
+    return x1, y1, x2 - x1, y2 - y1
+
+
+# ---------- ОСНОВНОЙ ЦИКЛ ----------
+# tracker is None -> режим поиска, иначе -> сопровождение
+tracker = kf = None
+misses, idx, conf, prev, raw_max = 0, 0, 0.0, time.time(), 0.0
+
+while True:
     success, frame = cap.read()
     if not success:
         break
-    
-    frame_idx += 1
-    
-    # Обчислення поточного FPS для відображення
-    curr_time = time.time()
-    if curr_time - prev_time > 0:
-        fps_display = 1.0 / (curr_time - prev_time)
-    prev_time = curr_time
+    idx += 1
+    now = time.time()
+    fps, prev = 1.0 / max(now - prev, 1e-6), now
+    show = frame.copy()
 
-    # Копія кадру для малювання графічних елементів
-    display_frame = frame.copy()
-
-    # ----------------------------------------------------
-    # СТАН 1: ПОШУК ЦІЛІ (STATE_SEARCHING)
-    # ----------------------------------------------------
-    if state == STATE_SEARCHING:
-        # Прохід YOLO на повному кадрі з упевненістю conf=0.6
-        results = model(frame, conf=0.6, verbose=False)
-        boxes = results[0].boxes
-
-        # Якщо на повному кадрі нічого не знайдено — пробуємо цифровий зум по центру
-        # Це допомагає виявити дрібні цілі / дрони на великій відстані
-        if len(boxes) == 0:
-            center_crop, c_info = apply_digital_zoom(frame, width//2, height//2, zoom_radius=250)
-            res_crop = model(center_crop, conf=0.20, verbose=False)[0].boxes
-            
-            if len(res_crop) > 0:
-                # Перераховуємо локальні координати кропу в глобальні координати кадру
-                lx1, ly1, lx2, ly2 = map(int, res_crop[0].xyxy[0].cpu().numpy())
-                gx1 = int(lx1 * c_info[2] + c_info[0])
-                gy1 = int(ly1 * c_info[3] + c_info[1])
-                gw, gh = int((lx2 - lx1) * c_info[2]), int((ly2 - ly1) * c_info[3])
-                
-                # Ініціалізуємо трекер та Калман для знайденої цілі
-                tracker = create_tracker()
-                tracker.init(frame, (gx1, gy1, gw, gh))
-                kf = Kalman6D(init_x=gx1 + gw//2, init_y=gy1 + gh//2)
-                state = STATE_TRACKING
-                misses = 0
-
-        # Якщо ціль знайдено безпосередньо на повному кадрі
-        if len(boxes) > 0 and state == STATE_SEARCHING:
-            box = boxes[0].xyxy[0].cpu().numpy()
-            xmin, ymin, xmax, ymax = map(int, box[:4])
-            w, h = xmax - xmin, ymax - ymin
-
-            # Ініціалізація трекера і Калмана
-            tracker = create_tracker()
-            tracker.init(frame, (xmin, ymin, w, h))
-            kf = Kalman6D(init_x=xmin + w//2, init_y=ymin + h//2)
-            state = STATE_TRACKING
-            misses = 0
-        
-        # Індикація статусу пошуку на екрані
-        if state == STATE_SEARCHING:
-            cv2.putText(display_frame, "SEARCHING (LOW CONF)...", (20, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-    # ----------------------------------------------------
-    # СТАН 2: СУПРОВІД ТА ВЕРИФІКАЦІЯ (STATE_TRACKING)
-    # ----------------------------------------------------
-    elif state == STATE_TRACKING:
-        # Оновлюємо стан оптичного трекера
-        tracking_success, bbox = tracker.update(frame)
-
-        if tracking_success:
-            x, y, w, h = map(int, bbox)
-            raw_cx, raw_cy = x + w // 2, y + h // 2
-
-            # 1. Екстраполяція (прогноз) фільтра Калмана
-            pred_cx, pred_cy = kf.predict()
-
-            # 2. Корекція стану Калмана реальними вимірюваннями від оптичного трекера
-            (corr_cx, corr_cy), (vx, vy), (ax, ay) = kf.correct(raw_cx, raw_cy)
-
-            # Отримуємо згладжені координати рамки
-            smooth_x, smooth_y = corr_cx - w // 2, corr_cy - h // 2
-
-            # 3. Цифровий зум (Digital Zoom) навколо скоригованого центру цілі
-            zoomed_frame, crop_info = apply_digital_zoom(frame, corr_cx, corr_cy, zoom_radius=140, target_size=(width, height))
-            x1_off, y1_off, scale_x, scale_y = crop_info
-
-            # 4. Пеperiodична верифікація через YOLO кожні N кадрів
-            if frame_idx % VERIFY_EVERY == 0:
-                # Детекція YOLO на кропі зі зниженим порогом упевненості
-                res = model(zoomed_frame, conf=0.20, verbose=False)[0].boxes
-                matched = False
-
-                for b in res:
-                    # Переведення координат детектованої рамки YOLO в глобальну систему
-                    lx1, ly1, lx2, ly2 = map(int, b.xyxy[0].cpu().numpy())
-                    gx1 = int(lx1 * scale_x + x1_off)
-                    gy1 = int(ly1 * scale_y + y1_off)
-                    gw, gh = int((lx2 - lx1) * scale_x), int((ly2 - ly1) * scale_y)
-
-                    # Перевіряємо, чи перекривається детекція YOLO з поточним трекером (IoU)
-                    if iou((smooth_x, smooth_y, w, h), (gx1, gy1, gw, gh)) > IOU_MIN:
-                        matched = True
-                        # Переініціалізуємо трекер точними координатами від YOLO
-                        tracker = create_tracker()
-                        tracker.init(frame, (gx1, gy1, gw, gh))
-                        # Скориговуємо фільтр Калмана новими точними координатами від YOLO
-                        kf.correct(gx1 + gw//2, gy1 + gh//2)
-                        smooth_x, smooth_y, w, h = gx1, gy1, gw, gh
-                        break
-
-                # Скидаємо або збільшуємо лічильник пропущених підтверджень
-                misses = 0 if matched else misses + 1
-                
-                # Якщо втратили ціль на занадто тривалий час — повертаємося до стану пошуку
-                if misses >= MAX_MISSES:
-                    state = STATE_SEARCHING
-                    tracker = None
-                    kf = None
-                    misses = 0
-
-            if state == STATE_TRACKING:
-                # Переведення глобальних координат цілі в локальні координати зумованого кадру для отрисовки
-                local_x = int((smooth_x - x1_off) / scale_x)
-                local_y = int((smooth_y - y1_off) / scale_y)
-                local_w, local_h = int(w / scale_x), int(h / scale_y)
-                
-                local_pred_cx = int((pred_cx - x1_off) / scale_x)
-                local_pred_cy = int((pred_cy - y1_off) / scale_y)
-
-                # Малювання рамки супроводу цілі
-                cv2.rectangle(zoomed_frame, (local_x, local_y), (local_x + local_w, local_y + local_h), (255, 0, 0), 2)
-                # Зелена крапка — екстрапольована точкова позиція (прогноз 6D Калмана)
-                cv2.circle(zoomed_frame, (local_pred_cx, local_pred_cy), 5, (0, 255, 0), -1)
-                cv2.putText(zoomed_frame, "TRACKING", (local_x, local_y - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                
-                display_frame = zoomed_frame
+    # --- ПОИСК: весь кадр, затем 4 тайла ---
+    if tracker is None:
+        raw_max = 0.0
+        for img, info, thr in search_views(frame):
+            drones, others = detect(img, thr, info)
+            for x, y, w, h, c in others:
+                cv2.rectangle(show, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                cv2.putText(show, f"NOT DRONE {c:.2f}", (x, max(15, y - 8)), F, 0.5, (0, 0, 255), 2)
+            for d in drones:
+                if (box := init_tracker(frame, *d[:4])):
+                    kf, misses, conf = new_kf(box[0] + box[2] // 2, box[1] + box[3] // 2), 0, d[4]
+                    break
+            if tracker is not None:
+                break
         else:
-            # Якщо трекер збігся/втратив об'єкт на кадрі
-            state = STATE_SEARCHING
-            tracker = None
-            kf = None
+            cv2.putText(show, f"SEARCHING (max drone conf {raw_max:.2f})", (20, 40), F, 0.7, (0, 0, 255), 2)
+
+    # --- СОПРОВОЖДЕНИЕ + ПРОВЕРКА YOLO ---
+    if tracker is not None:
+        ok, bbox = tracker.update(frame)
+        lost = not ok
+        if ok:
+            x, y, w, h = map(int, bbox)
+            px, py = kf.predict()[:2, 0].astype(int)
+            cx, cy = kf.correct(np.float32([[x + w // 2], [y + h // 2]]))[:2, 0].astype(int)
+            box = (cx - w // 2, cy - h // 2, w, h)  # сглаженная рамка
+            small = max(w, h) < SMALL_PX  # малая цель: чаще проверяем и сильнее приближаем
+            zoomed, info = zoom(frame, cx, cy, 90 if small else 140)
+
+            if idx % (2 if small else VERIFY_EVERY) == 0:
+                drones, others = detect(zoomed, CONF_VERIFY, info)
+                # 1. дрон, который пересекается с рамкой трекера
+                best = max((d for d in drones if iou(box, d) > IOU_MIN), key=lambda d: iou(box, d), default=None)
+                # 2. трекер мог уехать на деревья: берём другой дрон, но только РЯДОМ
+                if best is None and drones:
+                    d = drones[0]
+                    if np.hypot(d[0] + d[2] / 2 - cx, d[1] + d[3] / 2 - cy) < RELATCH_DIST * max(w, h, 15):
+                        best = d
+
+                if best:  # YOLO подтвердила дрон — перезапускаем трекер на точной рамке
+                    conf, misses = best[4], 0
+                    if (new := init_tracker(frame, *best[:4])):
+                        box = new
+                        kf.correct(np.float32([[box[0] + box[2] // 2], [box[1] + box[3] // 2]]))
+                else:     # не подтвердила: сброс, если на цели самолёт/птица или слишком много промахов
+                    misses += 1
+                    lost = misses >= MAX_MISSES or any(iou(box, o) > IOU_MIN for o in others)
+
+            if not lost:
+                ox, oy, sx, sy = info
+                lx, ly = int((box[0] - ox) / sx), int((box[1] - oy) / sy)
+                cv2.rectangle(zoomed, (lx, ly), (lx + int(box[2] / sx), ly + int(box[3] / sy)), (255, 0, 0), 2)
+                cv2.circle(zoomed, (int((px - ox) / sx), int((py - oy) / sy)), 5, (0, 255, 0), -1)
+                cv2.putText(zoomed, f"TRACKING: {model.names[DRONE]} ({conf:.2f})",
+                            (lx, max(15, ly - 10)), F, 0.5, (255, 0, 0), 2)
+                show = zoomed
+        if lost:
+            tracker = kf = None
             misses = 0
 
-    # Відображення FPS на екрані
-    cv2.putText(display_frame, f"FPS: {fps_display:.1f}", (20, 80), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    
-    # Запис та відображення кадру
-    out.write(display_frame)
-    cv2.imshow("Anti-UAV 6D Tracker", display_frame)
-
-    # Вихід при натисканні клавіші 'q'
+    cv2.putText(show, f"FPS: {fps:.1f}", (20, 80), F, 0.7, (0, 255, 255), 2)
+    out.write(show)
+    cv2.imshow("Anti-UAV 6D Tracker", show)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# ==========================================
-# 5. ОЧИЩЕННЯ РЕСУРСІВ
-# ==========================================
 cap.release()
 out.release()
 cv2.destroyAllWindows()
-print(f"Обробку завершено. Результат збережено у: {output_path}")
+print(f"Обработка завершена. Результат сохранён в: {VIDEO_OUT}")
